@@ -1005,13 +1005,15 @@ class UnifiedAgent:
 
         完整流程：
           1. 生成 Embedding 向量
-          2. store_classified()：LLM 分类 + 去重（cosine ≥ 0.95 视为重复）
-          3. 写入 PostgreSQL（embedding JSON 序列化）
-          4. 图索引：在 Neo4j 中创建 Memory 节点 + FOLLOWS 边
-          5. 合并检查：每 5 条新记忆后触发 consolidate()
-              - 重要性衰减（每日 ×0.995）
-              - 去重合并（cosine ≥ 0.80 的相似记忆合并）
-              - 过期淘汰（>30 天 + 重要性 < 0.3 的记忆删除）
+          2. store_classified()：内存去重（cosine ≥ 0.95 视为重复）
+          3. 持久化到 PG（新增 INSERT）
+          4. 图索引：Neo4j 创建 Memory 节点 + FOLLOWS 边
+          5. 合并检查：每 N 条新记忆触发 consolidate()（默认 N=10）
+              - Phase 1: 重要性衰减（每日 ×0.995）
+              - Phase 2: 去重合并（cosine ≥ 0.80 的相似记忆合并）
+              - Phase 3: 过期淘汰（>30 天 + 重要性 < 0.3）
+              - 同步 PG：DELETE 被淘汰的去重条目，UPDATE 内容/重要性变化条目
+              - 同步 Neo4j：删除淘汰节点的图关系
         """
         try:
             # 生成 Embedding 向量
@@ -1038,8 +1040,29 @@ class UnifiedAgent:
                     prev_item = prev[-2] if len(prev) > 1 else None
                     self._mem.graph_mem.index_memory(item, prev_item)
 
-            # 每 5 条新记忆触发合并检查
+            # 每 N 条新记忆触发合并检查（默认 10 条）
             if self._mem.ltm.need_consolidation():
-                self._mem.ltm.consolidate()
+                result = self._mem.ltm.consolidate()
+
+                # ── 同步 PG：DELETE 被淘汰/去重的全部记忆 ──
+                if result["deleted_ids"]:
+                    self._repos.ltm.delete(result["deleted_ids"])
+                    logger.info(f"长期记忆合并：已删除 {len(result['deleted_ids'])} 条")
+
+                # ── 同步 PG：UPDATE 内容/重要性变化的记忆 ──
+                for it in result["updated_items"]:
+                    self._repos.ltm.update(
+                        id=it.id, content=it.content, importance=it.importance,
+                        embedding_json=json.dumps(it.embedding).encode(),
+                    )
+
+                # ── 同步 Neo4j ──
+                if self._mem.graph_mem and self._mem.graph_mem.available():
+                    # Phase 2 合并：保留节点吸收被删节点的关系，再删旧节点
+                    for keep_id, remove_ids in result["merged_pairs"].items():
+                        self._mem.graph_mem.merge_graph_nodes(keep_id, remove_ids)
+                    # Phase 3 过期淘汰：直接删节点（DETACH DELETE 自动清理关系）
+                    for eid in result["evicted_ids"]:
+                        self._mem.graph_mem.delete_memory_node(eid)
         except Exception as e:
             logger.warning(f"storeLTM failed: {e}")
