@@ -381,6 +381,8 @@ class UnifiedAgent:
                                self._cfg.KGWeight, extractor)
             # 用 Neo4j 图增强记忆恢复（替代纯 LTM 语义搜索）
             self._mem.graph_mem = GraphMemory(neo4j_client, self._mem.ltm)
+            # 将 KGStore 注入 RAG 引擎：ingest 时写实体关系，query 时图检索
+            self._rag.set_kg_store(self._kg)
 
     def _build_prompt_ctx(self):
         """

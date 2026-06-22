@@ -5,7 +5,7 @@
 =============================================================================
 
 两个入口：
-  ingest(text)  → 上传文档：切块 → Embedding → 三端写入（PG + Milvus + ES）
+  ingest(text)  → 上传文档：切块 → Embedding → 四端写入（PG + Milvus + ES + Neo4j）
   query(text)   → 检索问答：改写 → 三路检索 → RRF融合 → 重排 → LLM合成
 
 架构位置：
@@ -16,7 +16,7 @@
   - 回调注入：通过 set_generate_fn / set_embed_fn 注入 LLM 函数，
     RAG 引擎本身不直接依赖 LLM 实现，测试时可以 Mock
   - 优雅降级：每一步都 try-catch，Milvus 挂了走 ES，ES 挂了走 TF 兜底
-  - 三写一读：写入时三端全写（用空间换鲁棒性），查询时并行检索
+  - 四写一读：写入时四端全写（PG+Milvus+ES+Neo4j，用空间换鲁棒性），查询时并行检索
   - 召回放大+精排：召回 top_k×3 候选 → LLM 精排 → 截回 top_k
 =============================================================================
 """
@@ -31,6 +31,7 @@ from src.domain.rag.splitter import split_text, Chunk
 from src.domain.rag.hybrid import rrf_fusion
 from src.domain.rag.rewriter import LLMRewriter, HistoryMessage
 from src.domain.rag.reranker import LLMReranker
+from src.domain.knowledge.types import ChunkRef
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +65,9 @@ class Engine:
         self._rewriter: Optional[LLMRewriter] = None                    # LLM 查询改写
         self._reranker: Optional[LLMReranker] = None                    # LLM 结果精排
 
+        # KGStore 由 core_agent._init_neo4j() 通过 set_kg_store() 注入
+        self._kgstore = None
+
     # ── 属性 ──
     @property
     def Loaded(self) -> bool:
@@ -91,6 +95,16 @@ class Engine:
     def set_reranker(self, reranker: LLMReranker):
         """注入结果重排器（可选，config.yaml: rag.rerank.enabled）"""
         self._reranker = reranker
+
+    def set_kg_store(self, kgstore):
+        """注入知识图谱存储（可选，Neo4j 不可用时为 None）
+
+        KGStore 负责：
+          - index_document(): ingest 时将实体关系写入 Neo4j
+          - search():         query 时从 Neo4j 图检索关联 chunk
+          - delete_document(): 删除文档时清理 Neo4j 中的实体和关系
+        """
+        self._kgstore = kgstore
 
     # ── 状态查询 ──
 
@@ -167,6 +181,7 @@ class Engine:
         )
 
         saved_count = 0
+        chunk_pg_ids: List[int] = []  # 每个 chunk 的 pg_id，用于 Neo4j KG 索引
         for i, chunk_text in enumerate(chunks):
             # ③ 生成 Embedding 向量
             #    调 DeepSeek embedding API → [0.023, -0.451, 0.789, ...]（1536维）
@@ -180,12 +195,15 @@ class Engine:
                     logger.warning(f"Embedding failed for chunk {i}: {e}")
 
             # ④-a 写入 PostgreSQL（数据源头，必须成功）
+            #      pg_id 由 PG 自增主键生成，是后续所有检索的关联键
             try:
                 pg_id, _ = self._repo.SavePG(doc_hash, i, chunk_text, embedding_json)
                 if pg_id > 0:
                     saved_count += 1
+                    chunk_pg_ids.append(pg_id)  # 记录 pg_id 供 Neo4j KG 索引
             except Exception as e:
                 logger.warning(f"Save PG failed for chunk {i}: {e}")
+                chunk_pg_ids.append(0)  # 写入失败的占位
                 continue  # PG 写失败就跳过当前块（不阻塞后续块）
 
         # ④-b 批量写入 Milvus（向量数据库，语义搜索用）
@@ -219,6 +237,23 @@ class Engine:
             except Exception as e:
                 logger.warning(f"ES index failed: {e}")
 
+        # ④-d 索引到 Neo4j 知识图谱（实体关系图，图扩散召回用）
+        #       LLM 从每个 chunk 抽取实体和关系 → 写入 Neo4j 节点和边
+        #       失败不阻塞，降级为两路检索（Milvus + ES）
+        if self._kgstore and self._kgstore.available():
+            try:
+                # 构建 ChunkRef 列表（只包含 PG 写入成功的 chunk）
+                chunk_refs = [
+                    ChunkRef(id=i, pg_id=chunk_pg_ids[i], content=chunks[i])
+                    for i in range(len(chunks))
+                    if chunk_pg_ids[i] > 0  # 过滤 PG 写入失败的块
+                ]
+                if chunk_refs:
+                    self._kgstore.index_document(doc_hash, chunk_refs)
+                    logger.info(f"知识图谱索引完成：docHash={doc_hash}，chunks={len(chunk_refs)}")
+            except Exception as e:
+                logger.warning(f"Neo4j KG index failed: {e}")
+
         # ⑤ 更新内存索引（线程安全）
         #    之后 query() 就可以搜到这些块了
         with self._mu:
@@ -231,9 +266,16 @@ class Engine:
         return saved_count, doc_hash
 
     def delete(self, doc_hash: str):
-        """删除指定文档的所有 chunks（从 PG + Milvus + ES 三端同时删除）"""
+        """删除指定文档的所有 chunks（从 PG + Milvus + ES + Neo4j 四端同时删除）"""
         if self._repo:
             self._repo.Delete(doc_hash)
+
+        # Neo4j KG：删除文档关联的实体节点和关系边
+        if self._kgstore and self._kgstore.available():
+            try:
+                self._kgstore.delete_document(doc_hash)
+            except Exception as e:
+                logger.warning(f"Neo4j KG delete failed: {e}")
 
     # ═══════════════════════════════════════════════════════════════════════
     #  query() — 检索问答入口（这才是 RAG 的核心）
@@ -307,6 +349,19 @@ class Engine:
                     hits = self._repo.SearchES(q, self._cfg.TopK)
                     es_hits.extend(
                         {"pg_id": h.PGID, "score": h.Score} for h in hits
+                    )
+                except Exception:
+                    pass
+
+            # 路3：Neo4j 知识图谱检索
+            #      从 query 中抽取实体 → 在 Neo4j 图中匹配实体节点
+            #      → 返回关联的 chunk 的 pg_id
+            #      Neo4j 不可用时静默跳过，降级为两路检索
+            if self._kgstore and self._kgstore.available():
+                try:
+                    results = self._kgstore.search(q, self._cfg.TopK)
+                    kg_hits.extend(
+                        {"pg_id": r.pg_id, "score": r.score} for r in results
                     )
                 except Exception:
                     pass
